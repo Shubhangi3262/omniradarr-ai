@@ -7,7 +7,7 @@ This project was built with [Single Scope](https://lovable.dev).
 
 **Live app**: https://omniradar-ai.lovable.app
 
-## Build with Lovable
+## Build with Single Scope
 
 Continue developing this project in the [Lovable editor](https://lovable.dev/projects/90d931a5-57de-4140-84b5-c5d1eea92131).
 
