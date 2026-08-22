@@ -41,11 +41,28 @@ export type Conflict = {
   confidence: number;
 };
 
+export type Hypothesis = {
+  statement: string;
+  verdict: "supported" | "refuted" | "unverified";
+  reasoning: string;
+  confidence: number;
+};
+
+export type LaneReport = {
+  agent: SignalCategory;
+  objective: string;
+  tool: string;
+  degraded: boolean;
+  findings: number;
+};
+
 export type AgentRunResult = {
   briefing: IntelBriefing;
   plan: PlanTask[];
   trace: TraceEvent[];
   conflicts: Conflict[];
+  hypotheses: Hypothesis[];
+  lanes: LaneReport[];
   critique: {
     confidence: number;
     coverage: string[];
