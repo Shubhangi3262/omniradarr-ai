@@ -6,11 +6,11 @@ At its core is an orchestrated agent graph, not a single chatbot: a planner brea
 
 The system maintains both short-term (per-run) and long-term (cross-run) memory digests for continuity between sweeps, tracks a hard execution budget with model-fallback chains (across multiple LLMs) and retry/backoff logic, and includes a built-in chaos-testing mode that can inject simulated tool outages and conflicting evidence to demonstrate resilience under adversarial conditions. Every run produces a full execution trace, a plan, resolved conflicts, tested hypotheses, per-lane reports, and a final structured briefing — headline, signals, competitor moves, opportunities, risks, and recommended actions — all exposed through a modern React/TanStack Start interface
 
-This project was built with [Single Scope](https://lovable.dev).
+This project was built with [Signal Scope](https://lovable.dev).
 
 **Live app**: https://omniradar-ai.lovable.app
 
-## Build with Single Scope
+## Build with Signal Scope
 
 Continue developing this project in the [Lovable editor](https://lovable.dev/projects/90d931a5-57de-4140-84b5-c5d1eea92131).
 
