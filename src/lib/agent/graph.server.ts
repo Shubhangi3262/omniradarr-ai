@@ -1,11 +1,14 @@
 import { Annotation, END, MemorySaver, Send, START, StateGraph } from "@langchain/langgraph";
 
 import { Budget, BudgetExhausted, callModel, parseJson } from "./llm.server";
+import { runRetrievalTool } from "./tools.server";
 import type {
   AgentRunResult,
   ChaosConfig,
   Conflict,
+  Hypothesis,
   IntelBriefing,
+  LaneReport,
   PlanTask,
   SignalCategory,
   TraceEvent,
@@ -19,6 +22,7 @@ type Evidence = {
   impact: "high" | "medium" | "low";
   source_hint: string;
   confidence: number;
+  tool?: string;
   degraded?: boolean;
 };
 
@@ -32,13 +36,16 @@ const StateAnn = Annotation.Root({
   plan: Annotation<PlanTask[]>({ reducer: (_a, b) => b, default: () => [] }),
   currentTask: Annotation<PlanTask | null>({ reducer: (_a, b) => b, default: () => null }),
   evidence: Annotation<Evidence[]>({ reducer: (a, b) => [...a, ...b], default: () => [] }),
+  lanes: Annotation<LaneReport[]>({ reducer: (a, b) => [...a, ...b], default: () => [] }),
   conflicts: Annotation<Conflict[]>({ reducer: (_a, b) => b, default: () => [] }),
+  hypotheses: Annotation<Hypothesis[]>({ reducer: (_a, b) => b, default: () => [] }),
   critique: Annotation<AgentRunResult["critique"]>({
     reducer: (_a, b) => b,
     default: () => ({ confidence: 0, coverage: [], gaps: [], verdict: "", replans: 0 }),
   }),
   replans: Annotation<number>({ reducer: (a, b) => Math.max(a, b), default: () => 0 }),
   signatures: Annotation<string[]>({ reducer: (a, b) => [...a, ...b], default: () => [] }),
+  progress: Annotation<number[]>({ reducer: (a, b) => [...a, ...b], default: () => [] }),
   briefing: Annotation<IntelBriefing | null>({ reducer: (_a, b) => b, default: () => null }),
 });
 
@@ -53,6 +60,7 @@ export type RunInput = {
   threadId?: string;
 };
 
+/** Checkpointing: state is persisted per thread, so a crashed run can be resumed. */
 const checkpointer = new MemorySaver();
 
 export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
@@ -65,7 +73,7 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
 
   /* ---------------- nodes ---------------- */
 
-  // 1. Dynamic planner — adaptive task decomposition, replans with critic feedback.
+  // 1. Dynamic planner — adaptive task decomposition, replans from critic feedback.
   const planner = async (s: State): Promise<Partial<State>> => {
     const replanning = s.replans > 0;
     log({
@@ -76,7 +84,8 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
         : "Decomposing objective into specialist tasks",
     });
 
-    const wanted = budget.strained ? 3 : 5;
+    // resource-aware decomposition: fewer lanes when the budget is strained
+    const wanted = budget.strained ? 2 : budget.remaining < 8 ? 3 : 5;
     let plan: PlanTask[] = [];
     try {
       const raw = await callModel({
@@ -93,7 +102,7 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
           s.focus.length ? `Preferred sources: ${s.focus.join(", ")}` : "",
           s.memoryDigest,
           replanning
-            ? `PREVIOUS ROUND WAS INSUFFICIENT. Unresolved gaps: ${s.critique.gaps.join("; ")}. Plan ONLY tasks that close these gaps.`
+            ? `PREVIOUS ROUND WAS INSUFFICIENT. Unresolved gaps: ${s.critique.gaps.join("; ")}. Plan ONLY tasks that close these gaps, and phrase them differently from before.`
             : "",
           `Resource constraint: at most ${wanted} tasks (execution budget is ${budget.remaining} model calls).`,
         ]
@@ -132,45 +141,51 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
   // 2. Conditional routing → parallel fan-out, one branch per specialist.
   const dispatch = (s: State) => s.plan.map((task) => new Send("specialist", { ...s, currentTask: task }));
 
-  // 3. Specialist agent — runs in parallel, degrades gracefully when its tool fails.
+  // 3. Specialist agent — parallel lane backed by the tool registry with fallbacks.
   const specialist = async (s: State): Promise<Partial<State>> => {
     const task = s.currentTask!;
     const node = `agent:${task.agent}`;
     try {
-      const raw = await callModel({
-        node,
+      const result = await runRetrievalTool({
+        agent: task.agent,
+        objective: task.objective,
+        topic: s.topic,
+        competitors: s.competitors,
+        memoryDigest: s.memoryDigest,
         budget,
         trace: log,
         chaosFailureRate,
-        json: true,
-        system: `You are the ${task.agent.toUpperCase()} specialist agent. Report only findings you can justify. Never invent URLs; source_hint names where to verify. Include an honest confidence 0-1 (lower it when you are unsure). Return JSON {"findings":[{"title":string,"insight":string,"impact":"high|medium|low","source_hint":string,"confidence":number}]} with 2-3 findings.`,
-        user: [
-          `Task: ${task.objective}`,
-          `Domain: ${s.topic}`,
-          s.competitors ? `Competitors: ${s.competitors}` : "",
-          s.memoryDigest,
-          `Today: ${new Date().toISOString().slice(0, 10)}. Prioritise the last 6 months.`,
-          "Keep insight under 240 characters.",
-        ]
-          .filter(Boolean)
-          .join("\n"),
       });
-      const findings = parseJson<{ findings: Omit<Evidence, "taskId" | "agent">[] }>(raw)?.findings ?? [];
-      if (!findings.length) throw new Error("no parsable findings");
-      const evidence = findings.slice(0, 3).map((f) => ({
+      const evidence: Evidence[] = result.findings.map((f) => ({
         ...f,
-        confidence: clamp(Number(f.confidence) || 0.5),
         taskId: task.id,
         agent: task.agent,
+        tool: result.tool,
+        ...(result.degraded ? { degraded: true } : {}),
       }));
-      log({ node, status: "ok", message: `${evidence.length} findings for "${task.objective.slice(0, 60)}"` });
-      return { evidence };
+      log({
+        node,
+        status: result.degraded ? "warn" : "ok",
+        message: `${evidence.length} findings via ${result.tool} for "${task.objective.slice(0, 56)}"`,
+      });
+      return {
+        evidence,
+        lanes: [
+          {
+            agent: task.agent,
+            objective: task.objective,
+            tool: result.tool,
+            degraded: result.degraded,
+            findings: evidence.length,
+          },
+        ],
+      };
     } catch (e) {
       // failure recovery: the branch degrades instead of killing the run
       log({
         node,
         status: "error",
-        message: `Branch failed (${e instanceof Error ? e.message : String(e)}) — marked as gap, run continues`,
+        message: `Lane failed (${e instanceof Error ? e.message : String(e)}) — marked as gap, run continues`,
       });
       return {
         evidence: [
@@ -178,12 +193,16 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
             taskId: task.id,
             agent: task.agent,
             title: `Unverified: ${task.agent} sweep incomplete`,
-            insight: `The ${task.agent} tool chain failed under the current conditions. This lane is unresolved and excluded from high-confidence conclusions.`,
+            insight: `Every tool in the ${task.agent} chain failed under the current conditions. This lane is unresolved and excluded from high-confidence conclusions.`,
             impact: "low",
             source_hint: "re-run this lane when the source is reachable",
             confidence: 0.1,
+            tool: "none",
             degraded: true,
           },
+        ],
+        lanes: [
+          { agent: task.agent, objective: task.objective, tool: "none", degraded: true, findings: 0 },
         ],
       };
     }
@@ -211,7 +230,7 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
 
     if (budget.remaining <= 1) {
       log({ node: "reconcile", status: "warn", message: "Low budget — heuristic reconciliation only" });
-      return { evidence: [], conflicts: heuristicConflicts(evidence) };
+      return { conflicts: heuristicConflicts(evidence) };
     }
 
     try {
@@ -222,9 +241,7 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
         json: true,
         system:
           'You are the ADJUDICATOR. Find claims where the evidence conflicts, weigh them by plausibility and stated confidence, and resolve each. Return JSON {"conflicts":[{"claim":string,"sides":[string],"resolution":string,"confidence":number}]}. If nothing conflicts return an empty array. Never resolve by averaging: pick the better-supported side and say why.',
-        user: evidence
-          .map((e, i) => `${i + 1}. [${e.agent} c=${e.confidence}] ${e.title} — ${e.insight}`)
-          .join("\n"),
+        user: evidence.map((e, i) => `${i + 1}. [${e.agent} c=${e.confidence}] ${e.title} — ${e.insight}`).join("\n"),
       });
       const conflicts = (parseJson<{ conflicts: Conflict[] }>(raw)?.conflicts ?? []).map((c) => ({
         ...c,
@@ -235,21 +252,69 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
         status: conflicts.length ? "warn" : "ok",
         message: conflicts.length ? `${conflicts.length} conflict(s) adjudicated` : "No contradictions detected",
       });
-      return { evidence: [], conflicts };
+      return { conflicts };
     } catch {
       log({ node: "reconcile", status: "error", message: "Adjudicator unavailable — heuristic fallback" });
-      return { evidence: [], conflicts: heuristicConflicts(evidence) };
+      return { conflicts: heuristicConflicts(evidence) };
     }
   };
 
-  // 5. Self-evaluation / hypothesis verification.
+  // 5. Hypothesis verification — state a falsifiable claim per lane and test it.
+  const verify = async (s: State): Promise<Partial<State>> => {
+    const solid = s.evidence.filter((e) => !e.degraded);
+    if (!solid.length) {
+      log({ node: "verifier", status: "warn", message: "No verifiable evidence — skipping hypothesis testing" });
+      return { hypotheses: [] };
+    }
+    if (budget.remaining <= 2) {
+      log({ node: "verifier", status: "warn", message: "Budget-constrained — heuristic hypothesis check" });
+      return { hypotheses: heuristicHypotheses(solid, s.conflicts) };
+    }
+    try {
+      const raw = await callModel({
+        node: "verifier",
+        budget,
+        trace: log,
+        json: true,
+        system:
+          'You are the VERIFIER. From the evidence, state 2-3 falsifiable hypotheses about where this domain is heading, then test each ONLY against the supplied evidence. Return JSON {"hypotheses":[{"statement":string,"verdict":"supported|refuted|unverified","reasoning":string,"confidence":number}]}. Mark "unverified" whenever the evidence is thin, degraded or disputed — do not reward guessing.',
+        user: [
+          `Domain: ${s.topic}`,
+          `Adjudicated conflicts: ${s.conflicts.map((c) => `${c.claim} → ${c.resolution}`).join(" | ") || "none"}`,
+          "Evidence:",
+          ...s.evidence.map((e) => `- [${e.agent} c=${e.confidence}${e.degraded ? " DEGRADED" : ""}] ${e.title}: ${e.insight}`),
+        ].join("\n"),
+      });
+      const hyps = (parseJson<{ hypotheses: Hypothesis[] }>(raw)?.hypotheses ?? []).map((h) => ({
+        statement: h.statement,
+        verdict: (["supported", "refuted", "unverified"].includes(h.verdict) ? h.verdict : "unverified") as Hypothesis["verdict"],
+        reasoning: h.reasoning ?? "",
+        confidence: clamp(Number(h.confidence) || 0.4),
+      }));
+      if (!hyps.length) throw new Error("no hypotheses");
+      log({
+        node: "verifier",
+        status: hyps.some((h) => h.verdict === "unverified") ? "warn" : "ok",
+        message: `${hyps.filter((h) => h.verdict === "supported").length}/${hyps.length} hypotheses supported`,
+      });
+      return { hypotheses: hyps };
+    } catch {
+      log({ node: "verifier", status: "error", message: "Verifier unavailable — heuristic hypothesis check" });
+      return { hypotheses: heuristicHypotheses(solid, s.conflicts) };
+    }
+  };
+
+  // 6. Self-evaluation.
   const critic = async (s: State): Promise<Partial<State>> => {
     const solid = s.evidence.filter((e) => !e.degraded);
-    const gapsFromFailures = [...new Set(s.evidence.filter((e) => e.degraded).map((e) => `${e.agent} lane unresolved`))];
+    const failedLanes = [...new Set(s.evidence.filter((e) => e.degraded).map((e) => e.agent))];
+    const gapsFromFailures = failedLanes.map((a) => `${a} lane unresolved (tool degraded)`);
+    const unverified = s.hypotheses.filter((h) => h.verdict === "unverified").map((h) => `unverified: ${h.statement}`);
+
     let critique: AgentRunResult["critique"] = {
       confidence: clamp(solid.length ? avg(solid.map((e) => e.confidence)) : 0.2),
       coverage: [...new Set(solid.map((e) => e.agent))],
-      gaps: gapsFromFailures,
+      gaps: [...gapsFromFailures, ...unverified],
       verdict: "Heuristic self-evaluation.",
       replans: s.replans,
     };
@@ -266,8 +331,11 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
           user: [
             `Objective: monitor "${s.topic}".`,
             `Resolved conflicts: ${s.conflicts.map((c) => c.claim).join("; ") || "none"}`,
+            `Hypothesis tests: ${s.hypotheses.map((h) => `${h.statement} [${h.verdict}]`).join(" | ") || "none"}`,
             "Evidence:",
-            ...s.evidence.map((e) => `- [${e.agent} c=${e.confidence}${e.degraded ? " DEGRADED" : ""}] ${e.title}: ${e.insight}`),
+            ...s.evidence.map(
+              (e) => `- [${e.agent} c=${e.confidence}${e.degraded ? " DEGRADED" : ""}] ${e.title}: ${e.insight}`,
+            ),
           ].join("\n"),
         });
         const j = parseJson<AgentRunResult["critique"]>(raw);
@@ -275,7 +343,7 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
           critique = {
             confidence: clamp(Number(j.confidence) || critique.confidence),
             coverage: j.coverage ?? critique.coverage,
-            gaps: [...new Set([...(j.gaps ?? []), ...gapsFromFailures])],
+            gaps: [...new Set([...(j.gaps ?? []), ...gapsFromFailures, ...unverified])],
             verdict: j.verdict ?? "",
             replans: s.replans,
           };
@@ -291,10 +359,10 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
       status: critique.confidence < 0.6 ? "warn" : "ok",
       message: `Confidence ${(critique.confidence * 100).toFixed(0)}% · gaps: ${critique.gaps.join("; ") || "none"}`,
     });
-    return { critique };
+    return { critique, progress: [progressScore(s.evidence, critique.confidence)] };
   };
 
-  // 6. Autonomous replan decision with loop / deadlock detection.
+  // 7. Autonomous replan decision with loop / deadlock detection.
   const route = (s: State): "planner" | "synthesize" => {
     const needsMore = s.critique.confidence < 0.62 || s.critique.gaps.length > 0;
     if (!needsMore) return "synthesize";
@@ -302,7 +370,7 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
       log({ node: "router", status: "warn", message: "Replan cap reached — proceeding with caveats" });
       return "synthesize";
     }
-    if (budget.remaining <= 2) {
+    if (budget.remaining <= 3) {
       log({ node: "router", status: "warn", message: "Insufficient budget to replan — proceeding with caveats" });
       return "synthesize";
     }
@@ -311,13 +379,23 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
       log({ node: "router", status: "error", message: "Loop detected: identical plan repeated — breaking cycle" });
       return "synthesize";
     }
+    // deadlock detection: two consecutive rounds with no measurable progress
+    const p = s.progress;
+    if (p.length >= 2 && p[p.length - 1]! <= p[p.length - 2]! + 0.02) {
+      log({
+        node: "router",
+        status: "error",
+        message: "Deadlock detected: replanning is no longer improving the answer — breaking out",
+      });
+      return "synthesize";
+    }
     log({ node: "router", status: "info", message: "Objective not met — autonomous replan" });
     return "planner";
   };
 
   const bumpReplan = async (s: State): Promise<Partial<State>> => ({ replans: s.replans + 1 });
 
-  // 7. Synthesis into the decision-ready briefing.
+  // 8. Synthesis into the decision-ready briefing.
   const synthesize = async (s: State): Promise<Partial<State>> => {
     const fallback = heuristicBriefing(s);
     if (budget.remaining <= 0) {
@@ -331,16 +409,18 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
         trace: log,
         json: true,
         system:
-          'You are the SYNTHESISER. Turn adjudicated evidence into one decision-ready briefing. Flag disputed items and low-confidence items honestly; state uncertainty in the summary rather than hiding it. Return ONLY JSON {"headline":string,"summary":string,"continuity":string,"signals":[{"category":"research|patent|news|competitor|social","title":string,"insight":string,"impact":"high|medium|low","source_hint":string,"is_new":boolean,"confidence":number,"disputed":boolean}],"competitor_moves":[{"name":string,"move":string,"implication":string}],"opportunities":[string],"risks":[string],"recommended_actions":[string]}. 3-5 competitor moves, 3-4 items per list.',
+          'You are the SYNTHESISER. Turn adjudicated evidence into one decision-ready briefing. Flag disputed and low-confidence items honestly; state uncertainty in the summary rather than hiding it. Return ONLY JSON {"headline":string,"summary":string,"continuity":string,"signals":[{"category":"research|patent|news|competitor|social","title":string,"insight":string,"impact":"high|medium|low","source_hint":string,"is_new":boolean,"confidence":number,"disputed":boolean}],"competitor_moves":[{"name":string,"move":string,"implication":string}],"opportunities":[string],"risks":[string],"recommended_actions":[string]}. 3-5 competitor moves, 3-4 items per list.',
         user: [
           `Domain: ${s.topic}`,
           s.competitors ? `Competitors: ${s.competitors}` : "",
           s.memoryDigest,
           `Self-evaluation: confidence ${(s.critique.confidence * 100).toFixed(0)}%, gaps: ${s.critique.gaps.join("; ") || "none"}. ${s.critique.verdict}`,
+          `Hypothesis tests: ${s.hypotheses.map((h) => `${h.statement} → ${h.verdict}`).join(" | ") || "none"}`,
           `Resolved conflicts: ${s.conflicts.map((c) => `${c.claim} → ${c.resolution}`).join(" | ") || "none"}`,
           "Evidence:",
           ...s.evidence.map(
-            (e) => `- [${e.agent} c=${e.confidence}${e.degraded ? " DEGRADED/UNVERIFIED" : ""}] ${e.title}: ${e.insight} (verify: ${e.source_hint})`,
+            (e) =>
+              `- [${e.agent} c=${e.confidence}${e.degraded ? " DEGRADED/UNVERIFIED" : ""}] ${e.title}: ${e.insight} (verify: ${e.source_hint})`,
           ),
         ]
           .filter(Boolean)
@@ -362,13 +442,15 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
     .addNode("planner", planner)
     .addNode("specialist", specialist)
     .addNode("reconcile", reconcile)
+    .addNode("verify", verify)
     .addNode("critic", critic)
     .addNode("bumpReplan", bumpReplan)
     .addNode("synthesize", synthesize)
     .addEdge(START, "planner")
     .addConditionalEdges("planner", dispatch, ["specialist"])
     .addEdge("specialist", "reconcile")
-    .addEdge("reconcile", "critic")
+    .addEdge("reconcile", "verify")
+    .addEdge("verify", "critic")
     .addConditionalEdges("critic", route, { planner: "bumpReplan", synthesize: "synthesize" })
     .addEdge("bumpReplan", "planner")
     .addEdge("synthesize", END)
@@ -389,7 +471,7 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
     )) as State;
   } catch (e) {
     if (e instanceof BudgetExhausted) throw new Error("The agent ran out of its execution budget before finishing.");
-    // last-resort recovery: recover whatever the checkpointer holds
+    // last-resort recovery: rebuild the answer from the last checkpoint
     const snap = await graph.getState({ configurable: { thread_id: threadId } });
     const partial = snap.values as State | undefined;
     if (!partial?.evidence?.length) throw e;
@@ -402,6 +484,8 @@ export async function runIntelGraph(input: RunInput): Promise<AgentRunResult> {
     plan: final.plan,
     trace,
     conflicts: final.conflicts,
+    hypotheses: final.hypotheses ?? [],
+    lanes: final.lanes ?? [],
     critique: final.critique,
     budget: { limit: budget.limit, used: budget.used, failures: budget.failures, fallbacks: budget.fallbacks },
     threadId,
@@ -421,6 +505,25 @@ function planSignature(plan: PlanTask[]) {
     .map((t) => `${t.agent}:${t.objective.slice(0, 40).toLowerCase()}`)
     .sort()
     .join("|");
+}
+function progressScore(evidence: Evidence[], confidence: number) {
+  const solid = evidence.filter((e) => !e.degraded).length;
+  return confidence * 0.7 + Math.min(1, solid / 8) * 0.3;
+}
+
+function heuristicHypotheses(evidence: Evidence[], conflicts: Conflict[]): Hypothesis[] {
+  const top = [...evidence].sort((a, b) => b.confidence - a.confidence).slice(0, 2);
+  return top.map((e) => {
+    const disputed = conflicts.some((c) => c.claim.toLowerCase().includes(e.title.slice(0, 24).toLowerCase()));
+    return {
+      statement: `${e.title} is a durable trend in this domain.`,
+      verdict: disputed ? "unverified" : e.confidence >= 0.7 ? "supported" : "unverified",
+      reasoning: disputed
+        ? "A contradicting source is unresolved, so the claim cannot be treated as verified."
+        : `Backed only by the ${e.agent} lane at confidence ${e.confidence.toFixed(2)}; corroboration from a second lane is missing.`,
+      confidence: disputed ? 0.3 : clamp(e.confidence * 0.8),
+    };
+  });
 }
 
 function heuristicConflicts(evidence: Evidence[]): Conflict[] {
@@ -443,7 +546,9 @@ function heuristicBriefing(s: State): IntelBriefing {
   return {
     headline: `${s.topic}: ${solid.length} verified signal${solid.length === 1 ? "" : "s"} under degraded conditions`,
     summary: `Assembled without the synthesiser after upstream failures. Confidence ${(s.critique.confidence * 100).toFixed(0)}%. ${s.critique.gaps.length ? `Open gaps: ${s.critique.gaps.join("; ")}.` : ""}`,
-    continuity: s.memoryDigest.includes("empty") ? "First sweep of this domain." : "Follow-up sweep; compare against stored briefings.",
+    continuity: s.memoryDigest.includes("empty")
+      ? "First sweep of this domain."
+      : "Follow-up sweep; compare against stored briefings.",
     signals: s.evidence.map((e) => ({
       category: e.agent,
       title: e.title,
