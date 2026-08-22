@@ -3,7 +3,7 @@
 please make direct ai agent code
 Problem Statement: Organizations, startups, and research institutions operate in highly competitive and rapidly evolving environments where staying updated on research trends, patent developments, competitor strategies, and industry news is critical. However, manually monitoring scientific publications, patent databases, news platforms, and social media sources is time-consuming, inefficient, and prone to missing important updates. The lack of timely insights can result in lost opportunities, delayed innovation, and weakened competitive positioning. Therefore, there is a need for an autonomous AI agent capable of continuously tracking research and competitor activities, analyzing vast information sources, and delivering concise, actionable insights in real time.
 
-This project was built with [Lovable](https://lovable.dev).
+This project was built with [Single Scope](https://lovable.dev).
 
 **Live app**: https://omniradar-ai.lovable.app
 
